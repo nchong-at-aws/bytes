@@ -63,6 +63,16 @@ pub struct BytesMut {
     len: usize,
     cap: usize,
     data: *mut Shared,
+    #[cfg(kani)]
+    ghost: Ghost,
+}
+
+// State used by verification
+#[cfg(kani)]
+struct Ghost {
+    original_vec_ptr: NonNull<u8>,
+    original_len: usize,
+    original_cap: usize,
 }
 
 // Thread-safe reference-counted container for the shared storage. This mostly
@@ -606,6 +616,10 @@ impl BytesMut {
                     self.ptr = vptr(v.as_mut_ptr().add(off));
                     self.len = v.len() - off;
                     self.cap = v.capacity() - off;
+
+                    // v is fresh so we need to recapture
+                    #[cfg(kani)]
+                    self.recapture_ghost();
                 }
 
                 return;
@@ -680,6 +694,10 @@ impl BytesMut {
         self.ptr = vptr(v.as_mut_ptr());
         self.len = v.len();
         self.cap = v.capacity();
+
+        // v is fresh so we need to recapture
+        #[cfg(kani)]
+        self.recapture_ghost();
     }
 
     /// Appends given bytes to this `BytesMut`.
@@ -772,6 +790,12 @@ impl BytesMut {
             len,
             cap,
             data: data as *mut _,
+            #[cfg(kani)]
+            ghost: Ghost {
+                original_vec_ptr: ptr,
+                original_len: len,
+                original_cap: cap,
+            },
         }
     }
 
@@ -1622,5 +1646,186 @@ mod fuzz {
             t1.join().unwrap();
             t2.join().unwrap();
         });
+    }
+}
+
+#[cfg(kani)]
+const MAX_KANI_ALLOCATION: usize = 1 << 47;
+// In the future this shouldn't be hardcoded
+// i.e., should be 1 << (PTR_WIDTH - kani::OBJECT_BITS - 1)
+// NB: if you specify a different object-bits at the command line then you *must* change this constant
+
+#[cfg(kani)]
+impl BytesMut {
+    fn recapture_ghost(&mut self) {
+        self.ghost.original_vec_ptr = self.ptr;
+        self.ghost.original_len = self.len;
+        self.ghost.original_cap = self.cap;
+    }
+
+    fn is_well_formed(&self) -> bool {
+        self.len <= self.cap
+            && match self.kind() {
+                KIND_VEC => self.is_well_formed_kind_vec(),
+                KIND_ARC => self.is_well_formed_kind_arc(),
+                _ => false,
+            }
+    }
+
+    fn is_well_formed_kind_vec(&self) -> bool {
+        assert!(self.kind() == KIND_VEC);
+        let vec_ptr = self.ghost.original_vec_ptr.as_ptr();
+        let vec_cap = self.ghost.original_cap;
+        let vec_end_ptr = unsafe { vec_ptr.offset(vec_cap as isize) };
+        let ptr = self.ptr.as_ptr();
+        let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
+	let cap_in_bounds = self.cap <= vec_cap;
+
+        ptr_in_bounds && cap_in_bounds
+    }
+
+    fn is_well_formed_kind_arc(&self) -> bool {
+        assert!(self.kind() == KIND_ARC);
+        let shared: *mut Shared = self.data as _;
+        unsafe {
+            let ref_count = (*shared).ref_count.load(Ordering::Relaxed);
+            let valid_ref_count = 1 <= ref_count;
+
+            let vec_ptr = (*shared).vec.as_mut_ptr();
+            let vec_cap = (*shared).vec.capacity();
+            let vec_end_ptr = vec_ptr.offset(vec_cap as isize);
+            let ptr = self.ptr.as_ptr();
+            let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
+            let cap_in_bounds = self.cap <= vec_cap;
+
+            valid_ref_count && ptr_in_bounds && cap_in_bounds
+        }
+    }
+
+    fn is_aliased_to_same_buffer(&self, other: &BytesMut) -> bool {
+        if self.kind() == KIND_VEC || other.kind() == KIND_VEC {
+            return false;
+        }
+        assert!(self.kind() == KIND_ARC);
+        assert!(other.kind() == KIND_ARC);
+        if self.data != other.data {
+            return false;
+        }
+        assert!(self.data == other.data);
+        let s1 = self.ptr.as_ptr();
+        let e1 = unsafe { s1.offset(self.cap as isize) };
+        let s2 = other.ptr.as_ptr();
+        let e2 = unsafe { s2.offset(other.cap as isize) };
+        e1 <= s2 || e2 <= s1
+    }
+
+    // Current issues:
+    // dangling pointer offset 0 -> spurious warning means capacity can't be 0
+    // overflow with object-bits (baked in 64-bit assumption too)
+    fn make_any() -> Self {
+        let buffer_cap: usize = kani::any();
+        kani::assume(0 < buffer_cap); //< See https://github.com/model-checking/kani/issues/763
+        kani::assume(buffer_cap <= isize::MAX as usize); //< max capacity of Vec<u8>
+        kani::assume(buffer_cap < MAX_KANI_ALLOCATION);
+        let mut b = BytesMut::with_capacity(buffer_cap);
+
+        // optionally turn into KIND_ARC
+        let make_kind_arc = kani::any();
+        if make_kind_arc {
+            unsafe {
+                b.promote_to_shared(2);
+            }
+            unsafe {
+                assert!(b.ptr.as_ptr() == (*b.data).vec.as_mut_ptr());
+            }
+            let ref_count = kani::any();
+            kani::assume(1 <= ref_count);
+            kani::assume(ref_count < isize::MAX as usize);
+            unsafe {
+                (*b.data).ref_count.store(ref_count, Ordering::Relaxed);
+            }
+
+            // ptr set to [0..buffer_cap)
+            let ptr_offset: usize = kani::any();
+            kani::assume(ptr_offset < buffer_cap);
+            let ptr = unsafe { b.ptr.as_ptr().offset(ptr_offset as isize) };
+            b.ptr = vptr(ptr);
+            unsafe {
+                assert!((*b.data).vec.as_mut_ptr() <= b.ptr.as_ptr());
+            }
+
+            // cap set within bounds
+            let max_cap = buffer_cap - ptr_offset;
+            let cap = kani::any();
+            kani::assume(cap < max_cap);
+            b.cap = cap;
+
+            // len set within cap
+            let len = kani::any();
+            kani::assume(len <= cap);
+            b.len = len;
+        } else {
+            // len set within buffer cap
+            let len = kani::any();
+            kani::assume(len <= buffer_cap);
+            b.len = len;
+        }
+
+        assert!(b.is_well_formed());
+        b
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn test_kind_representation_change() {
+        let mut a = BytesMut::from(&b"helloworld"[..]);
+        assert!(a.kind() == KIND_VEC);
+        let mut b = a.split_off(5);
+        assert!(a.kind() == KIND_ARC);
+        assert!(b.kind() == KIND_ARC);
+        assert!(&a[..] == b"hello");
+        assert!(&b[..] == b"world");
+        b.reserve(3);
+        assert!(b.kind() == KIND_VEC);
+    }
+
+    #[kani::proof]
+    fn with_capacity_returns_well_formed_bytes_mut() {
+        let cap = kani::any();
+        kani::assume(0 < cap); //< See https://github.com/model-checking/kani/issues/763
+        kani::assume(    cap < MAX_KANI_ALLOCATION);
+        let a = BytesMut::with_capacity(cap);
+        assert!(a.kind() == KIND_VEC);
+        assert!(a.is_well_formed());
+    }
+
+    #[kani::proof]
+    fn split_off_maintains_well_formed() {
+        let mut a = BytesMut::make_any();
+        let at = kani::any();
+        kani::assume(at <= a.capacity());
+        let b = a.split_off(at);
+        assert!(a.is_well_formed());
+        assert!(b.is_well_formed());
+        //following verifies but slows down proof
+        //assert!(a.is_aliased_to_same_buffer(&b));
+    }
+
+    #[kani::proof]
+    fn reserve_maintains_well_formed() {
+        let cap = 1024; //< ideally kani::any()
+        let mut a = BytesMut::with_capacity(cap);
+        if kani::any() {
+            let _b = a.split_off(0);
+            assert!(a.kind() == KIND_ARC);
+        }
+        let additional = kani::any();
+        kani::assume(additional < MAX_KANI_ALLOCATION - cap);
+        a.reserve(additional);
+        assert!(a.is_well_formed());
     }
 }
