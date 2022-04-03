@@ -1651,7 +1651,7 @@ mod fuzz {
 
 #[cfg(kani)]
 const MAX_KANI_ALLOCATION: usize = 1 << 47;
-// In the future this shouldn't be hardcoded
+// In the future this shouldn't be hardcoded ()
 // i.e., should be 1 << (PTR_WIDTH - kani::OBJECT_BITS - 1)
 // NB: if you specify a different object-bits at the command line then you *must* change this constant
 
@@ -1718,14 +1718,21 @@ impl BytesMut {
         let e2 = unsafe { s2.offset(other.cap as isize) };
         e1 <= s2 || e2 <= s1
     }
+}
 
+#[cfg(kani)]
+impl kani::Arbitrary for BytesMut {
     // Current issues:
-    // dangling pointer offset 0 -> spurious warning means capacity can't be 0
-    // overflow with object-bits (baked in 64-bit assumption too)
-    fn make_any() -> Self {
+    // - dangling pointer offset 0 -> spurious warning means capacity can't be 0
+    // - allocation > isize::MAX does not actually cause panic
+    // - overflow with object-bits (baked in 64-bit assumption too)
+    // - further nondeterminism possible with KIND_VEC by advancing `ptr` is
+    // blocked by handling pointer subtraction needed in `drop`
+    // (https://github.com/model-checking/kani/issues/786#issuecomment-1079425875)
+    fn any() -> Self {
         let buffer_cap: usize = kani::any();
-        kani::assume(0 < buffer_cap); //< See https://github.com/model-checking/kani/issues/763
-        kani::assume(buffer_cap <= isize::MAX as usize); //< max capacity of Vec<u8>
+        kani::assume(0 < buffer_cap);
+        kani::assume(buffer_cap <= isize::MAX as usize);
         kani::assume(buffer_cap < MAX_KANI_ALLOCATION);
         let mut b = BytesMut::with_capacity(buffer_cap);
 
@@ -1765,14 +1772,31 @@ impl BytesMut {
             kani::assume(len <= cap);
             b.len = len;
         } else {
+          //let offset = kani::any();
+          //kani::assume(offset <= buffer_cap);
+          //b.advance(offset);
+
             // len set within buffer cap
             let len = kani::any();
-            kani::assume(len <= buffer_cap);
+            kani::assume(len <= b.cap);
             b.len = len;
         }
 
         assert!(b.is_well_formed());
         b
+    }
+}
+
+#[cfg(kani)]
+impl BytesMut {
+    /// A more constrained symbolic BytesMut
+    fn any_kind(cap: usize) -> Self {
+        let mut a = BytesMut::with_capacity(cap);
+        if kani::any() {
+            let _b = a.split_off(cap);
+            assert!(a.kind() == KIND_ARC);
+        }
+        a
     }
 }
 
@@ -1803,29 +1827,118 @@ mod verification {
         assert!(a.is_well_formed());
     }
 
+    /// This will not currently verify due to
+    /// - dangling pointer offset 0 -> spurious warning means capacity can't be 0
+    /*
+    #[kani::proof]
+    fn new_returns_well_formed_bytes_mut() {
+        let a = BytesMut::new();
+        assert!(a.kind() == KIND_VEC);
+        assert!(a.is_well_formed());
+    }
+    */
+
+    /// No well-formedness proof necessary for "read-only" methods
+    /// - len()
+    /// - is_empty()
+    /// - capacity()
+
     #[kani::proof]
     fn split_off_maintains_well_formed() {
-        let mut a = BytesMut::make_any();
+        let mut a: BytesMut = kani::any();
         let at = kani::any();
         kani::assume(at <= a.capacity());
         let b = a.split_off(at);
         assert!(a.is_well_formed());
         assert!(b.is_well_formed());
-        //following verifies but slows down proof
-        //assert!(a.is_aliased_to_same_buffer(&b));
+        // Additional checks that the operation does what we expect
+        assert!(a.cap == at);
+        unsafe {
+             assert!(b.ptr.as_ptr() == a.ptr.as_ptr().offset(at as isize));
+        }
     }
 
     #[kani::proof]
-    fn reserve_maintains_well_formed() {
-        let cap = 1024; //< ideally kani::any()
-        let mut a = BytesMut::with_capacity(cap);
-        if kani::any() {
-            let _b = a.split_off(0);
-            assert!(a.kind() == KIND_ARC);
+    fn split_maintains_well_formed() {
+        let mut a: BytesMut = kani::any();
+        let b = a.split();
+        assert!(a.is_well_formed());
+        assert!(b.is_well_formed());
+        // Additional checks that the operation does what we expect
+        assert!(b.is_empty());
+    }
+
+    #[kani::proof]
+    fn split_to_maintains_well_formed() {
+        let mut a: BytesMut = kani::any();
+        let at = kani::any();
+        kani::assume(at <= a.len());
+        let b = a.split_to(at);
+        assert!(a.is_well_formed());
+        assert!(b.is_well_formed());
+        // Additional checks that the operation does what we expect
+        unsafe {
+             assert!(a.ptr.as_ptr() == b.ptr.as_ptr().offset(at as isize));
         }
+        assert!(b.cap == at);
+    }
+
+    #[kani::proof]
+    fn truncate_maintains_well_formed() {
+        let mut a: BytesMut = kani::any();
+        let len = kani::any();
+        a.truncate(len);
+        assert!(a.is_well_formed());
+    }
+
+    #[kani::proof]
+    fn clear_maintains_well_formed() {
+        let mut a: BytesMut = kani::any();
+        a.clear();
+        assert!(a.is_well_formed());
+        // Additional checks that the operation does what we expect
+        assert!(a.is_empty());
+    }
+
+    /// Due to Kani's allocation we cannot express that this always results in
+    /// *initialized* data being brought into scope
+    #[kani::proof]
+    fn set_len_maintains_well_formed() {
+        let mut a: BytesMut = kani::any();
+        let len = kani::any();
+        kani::assume(len <= a.capacity());
+        unsafe { a.set_len(len); }
+        assert!(a.is_well_formed());
+    }
+
+    /// This proves a limited result that `reserve` maintains the `BytesMut`
+    /// representation invariant for a fixed capacity (but using either
+    /// representation). The "natural" way that we would write the / harness runs
+    /// into scalability problems (Kani timeout).
+    ///
+    /// ```
+    /// let mut a: BytesMut = kani::any();
+    /// let additional = kani::any();
+    /// kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
+    /// a.reserve(additional);
+    /// assert!(a.is_well_formed());
+    /// ```
+    #[kani::proof]
+    fn reserve_maintains_well_formed() {
+        let mut a = BytesMut::any_kind(1024);
         let additional = kani::any();
-        kani::assume(additional < MAX_KANI_ALLOCATION - cap);
+        kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
         a.reserve(additional);
+        assert!(a.is_well_formed());
+    }
+
+    /// Similar to reserve_maintains_well_formed
+    #[kani::proof]
+    fn resize_maintains_well_formed() {
+        let mut a = BytesMut::any_kind(1024);
+        let additional = kani::any();
+        kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
+        a.resize(additional, kani::any());
         assert!(a.is_well_formed());
     }
 }
