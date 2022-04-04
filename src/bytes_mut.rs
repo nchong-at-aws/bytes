@@ -1651,7 +1651,7 @@ mod fuzz {
 
 #[cfg(kani)]
 const MAX_KANI_ALLOCATION: usize = 1 << 47;
-// In the future this shouldn't be hardcoded ()
+// In the future this shouldn't be hardcoded (https://github.com/model-checking/kani/issues/917)
 // i.e., should be 1 << (PTR_WIDTH - kani::OBJECT_BITS - 1)
 // NB: if you specify a different object-bits at the command line then you *must* change this constant
 
@@ -1787,7 +1787,7 @@ impl kani::Arbitrary for BytesMut {
     }
 }
 
-/// Well-formedness proofs for API methods. Note that we don't need proof /
+/// Well-formedness proofs for API methods. Note that we don't need proof
 /// harnesses for "read-only" methods like `len`, `is_empty` and `capacity`.
 #[cfg(kani)]
 mod verification {
@@ -1884,8 +1884,8 @@ mod verification {
         assert!(a.is_empty());
     }
 
-    /// Due to Kani's allocation we cannot express that this always results in
-    /// *initialized* data being brought into scope
+    /// Due to Kani's allocation of new memory we cannot express that this
+    /// always results in *initialized* data being brought into scope
     #[kani::proof]
     fn set_len_maintains_well_formed() {
         let mut a: BytesMut = kani::any();
@@ -1901,7 +1901,7 @@ mod verification {
 #[cfg(kani)]
 impl BytesMut {
     /// A more constrained symbolic BytesMut with a *fixed* (rather than
-    /// symbolic) capacity, but / of either KIND_VEC or KIND_ARC.
+    /// symbolic) capacity, but of either KIND_VEC or KIND_ARC.
     #[inline(always)]
     fn any_kind(cap: usize) -> Self {
         let mut a = BytesMut::with_capacity(cap);
@@ -1919,7 +1919,7 @@ mod bounded_results {
 
     /// This proves a limited result that `reserve` maintains the `BytesMut`
     /// representation invariant for a fixed capacity (but using either
-    /// representation). The "natural" way that we would write the / harness runs
+    /// representation). The "natural" way that we would write the harness runs
     /// into scalability problems (Kani timeout).
     ///
     /// ```
