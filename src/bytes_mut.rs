@@ -18,6 +18,8 @@ use crate::bytes::Vtable;
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use crate::{Buf, BufMut, Bytes};
+#[cfg(kani)]
+use kani::Invariant;
 
 /// A unique reference to a contiguous slice of memory.
 ///
@@ -1663,45 +1665,6 @@ impl BytesMut {
         self.ghost.original_cap = self.cap;
     }
 
-    fn is_well_formed(&self) -> bool {
-        self.len <= self.cap
-            && match self.kind() {
-                KIND_VEC => self.is_well_formed_kind_vec(),
-                KIND_ARC => self.is_well_formed_kind_arc(),
-                _ => false,
-            }
-    }
-
-    fn is_well_formed_kind_vec(&self) -> bool {
-        assert!(self.kind() == KIND_VEC);
-        let vec_ptr = self.ghost.original_vec_ptr.as_ptr();
-        let vec_cap = self.ghost.original_cap;
-        let vec_end_ptr = unsafe { vec_ptr.offset(vec_cap as isize) };
-        let ptr = self.ptr.as_ptr();
-        let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
-        let cap_in_bounds = self.cap <= vec_cap;
-
-        ptr_in_bounds && cap_in_bounds
-    }
-
-    fn is_well_formed_kind_arc(&self) -> bool {
-        assert!(self.kind() == KIND_ARC);
-        let shared: *mut Shared = self.data as _;
-        unsafe {
-            let ref_count = (*shared).ref_count.load(Ordering::Relaxed);
-            let valid_ref_count = 1 <= ref_count;
-
-            let vec_ptr = (*shared).vec.as_mut_ptr();
-            let vec_cap = (*shared).vec.capacity();
-            let vec_end_ptr = vec_ptr.offset(vec_cap as isize);
-            let ptr = self.ptr.as_ptr();
-            let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
-            let cap_in_bounds = self.cap <= vec_cap;
-
-            valid_ref_count && ptr_in_bounds && cap_in_bounds
-        }
-    }
-
     fn is_aliased_to_same_buffer(&self, other: &BytesMut) -> bool {
         if self.kind() == KIND_VEC || other.kind() == KIND_VEC {
             return false;
@@ -1717,6 +1680,52 @@ impl BytesMut {
         let s2 = other.ptr.as_ptr();
         let e2 = unsafe { s2.offset(other.cap as isize) };
         e1 <= s2 || e2 <= s1
+    }
+}
+
+
+#[cfg(kani)]
+unsafe impl kani::Invariant for BytesMut {
+    fn is_valid(&self) -> bool {
+        self.len <= self.cap
+            && match self.kind() {
+                KIND_VEC => self.is_valid_kind_vec(),
+                KIND_ARC => self.is_valid_kind_arc(),
+                _ => false,
+            }
+    }
+}
+
+#[cfg(kani)]
+impl BytesMut {
+    fn is_valid_kind_vec(&self) -> bool {
+        assert!(self.kind() == KIND_VEC);
+        let vec_ptr = self.ghost.original_vec_ptr.as_ptr();
+        let vec_cap = self.ghost.original_cap;
+        let vec_end_ptr = unsafe { vec_ptr.offset(vec_cap as isize) };
+        let ptr = self.ptr.as_ptr();
+        let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
+        let cap_in_bounds = self.cap <= vec_cap;
+
+        ptr_in_bounds && cap_in_bounds
+    }
+
+    fn is_valid_kind_arc(&self) -> bool {
+        assert!(self.kind() == KIND_ARC);
+        let shared: *mut Shared = self.data as _;
+        unsafe {
+            let ref_count = (*shared).ref_count.load(Ordering::Relaxed);
+            let valid_ref_count = 1 <= ref_count;
+
+            let vec_ptr = (*shared).vec.as_mut_ptr();
+            let vec_cap = (*shared).vec.capacity();
+            let vec_end_ptr = vec_ptr.offset(vec_cap as isize);
+            let ptr = self.ptr.as_ptr();
+            let ptr_in_bounds = vec_ptr <= ptr && ptr <= vec_end_ptr;
+            let cap_in_bounds = self.cap <= vec_cap;
+
+            valid_ref_count && ptr_in_bounds && cap_in_bounds
+        }
     }
 }
 
@@ -1782,7 +1791,7 @@ impl kani::Arbitrary for BytesMut {
             b.len = len;
         }
 
-        assert!(b.is_well_formed());
+        assert!(b.is_valid());
         b
     }
 }
@@ -1813,7 +1822,7 @@ mod verification {
         kani::assume(cap < MAX_KANI_ALLOCATION);
         let a = BytesMut::with_capacity(cap);
         assert!(a.kind() == KIND_VEC);
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
 
     /// This will not currently verify due to
@@ -1823,7 +1832,7 @@ mod verification {
     fn new_returns_well_formed_bytes_mut() {
         let a = BytesMut::new();
         assert!(a.kind() == KIND_VEC);
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
     */
 
@@ -1833,8 +1842,8 @@ mod verification {
         let at = kani::any();
         kani::assume(at <= a.capacity());
         let b = a.split_off(at);
-        assert!(a.is_well_formed());
-        assert!(b.is_well_formed());
+        assert!(a.is_valid());
+        assert!(b.is_valid());
         // Additional checks that the operation does what we expect
         assert!(a.cap == at);
         unsafe {
@@ -1846,8 +1855,8 @@ mod verification {
     fn split_maintains_well_formed() {
         let mut a: BytesMut = kani::any();
         let b = a.split();
-        assert!(a.is_well_formed());
-        assert!(b.is_well_formed());
+        assert!(a.is_valid());
+        assert!(b.is_valid());
         // Additional checks that the operation does what we expect
         assert!(a.is_empty());
     }
@@ -1858,8 +1867,8 @@ mod verification {
         let at = kani::any();
         kani::assume(at <= a.len());
         let b = a.split_to(at);
-        assert!(a.is_well_formed());
-        assert!(b.is_well_formed());
+        assert!(a.is_valid());
+        assert!(b.is_valid());
         // Additional checks that the operation does what we expect
         unsafe {
             assert!(a.ptr.as_ptr() == b.ptr.as_ptr().offset(at as isize));
@@ -1872,14 +1881,14 @@ mod verification {
         let mut a: BytesMut = kani::any();
         let len = kani::any();
         a.truncate(len);
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
 
     #[kani::proof]
     fn clear_maintains_well_formed() {
         let mut a: BytesMut = kani::any();
         a.clear();
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
         // Additional checks that the operation does what we expect
         assert!(a.is_empty());
     }
@@ -1894,7 +1903,7 @@ mod verification {
         unsafe {
             a.set_len(len);
         }
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
 }
 
@@ -1927,7 +1936,7 @@ mod bounded_results {
     /// let additional = kani::any();
     /// kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
     /// a.reserve(additional);
-    /// assert!(a.is_well_formed());
+    /// assert!(a.is_valid());
     /// ```
     #[kani::proof]
     fn reserve_maintains_well_formed() {
@@ -1935,7 +1944,7 @@ mod bounded_results {
         let additional = kani::any();
         kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
         a.reserve(additional);
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
 
     /// Unfortunately, a similar bounded harness for `resize` causes timeout
@@ -1947,7 +1956,7 @@ mod bounded_results {
     ///     let additional = kani::any();
     ///     kani::assume(additional < MAX_KANI_ALLOCATION - a.capacity());
     ///     a.resize(additional, kani::any());
-    ///     assert!(a.is_well_formed());
+    ///     assert!(a.is_valid());
     /// }
     /// ```
 
@@ -1958,6 +1967,6 @@ mod bounded_results {
         let mut a = BytesMut::any_kind(4);
         let extend: kani::slice::NonDetSlice<u8, 2> = kani::slice::any_slice();
         a.extend_from_slice(&extend);
-        assert!(a.is_well_formed());
+        assert!(a.is_valid());
     }
 }
