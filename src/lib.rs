@@ -4,7 +4,7 @@
     attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
 ))]
 #![no_std]
-#![feature(min_specialization)]
+#![cfg_attr(kani, feature(min_specialization))]
 
 //! Provides abstractions for working with bytes.
 //!
