@@ -1965,7 +1965,7 @@ mod bounded_results {
     #[kani::proof]
     fn extend_from_slice_maintains_well_formed() {
         let mut a = BytesMut::any_kind(4);
-        let extend: kani::slice::NonDetSlice<u8, 2> = kani::slice::any_slice();
+        let extend: kani::slice::AnySlice<u8, 2> = kani::slice::any_slice();
         a.extend_from_slice(&extend);
         assert!(a.is_valid());
     }
