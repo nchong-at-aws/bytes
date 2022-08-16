@@ -2,8 +2,8 @@
 
 This fork uses [Kani](https://github.com/model-checking/kani) to verify proof
 harnesses for `BytesMut` methods showing that they maintain a representation
-invariant (a well-formedness condition).  This example shows Kani's `Invariant`
-trait to define `is_valid()` (the representation invariant) and `Arbitrary`
+invariant (a well-formedness condition).  This example shows how to define the
+`is_valid()` method (i.e., the representation invariant) and Kani's `Arbitrary`
 trait to define a `any()` constructor.
 
 ## Dependencies

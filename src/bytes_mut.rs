@@ -18,8 +18,6 @@ use crate::bytes::Vtable;
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use crate::{Buf, BufMut, Bytes};
-#[cfg(kani)]
-use kani::Invariant;
 
 /// A unique reference to a contiguous slice of memory.
 ///
@@ -1683,9 +1681,8 @@ impl BytesMut {
     }
 }
 
-
 #[cfg(kani)]
-unsafe impl kani::Invariant for BytesMut {
+impl BytesMut {
     fn is_valid(&self) -> bool {
         self.len <= self.cap
             && match self.kind() {
@@ -1694,10 +1691,7 @@ unsafe impl kani::Invariant for BytesMut {
                 _ => false,
             }
     }
-}
 
-#[cfg(kani)]
-impl BytesMut {
     fn is_valid_kind_vec(&self) -> bool {
         assert!(self.kind() == KIND_VEC);
         let vec_ptr = self.ghost.original_vec_ptr.as_ptr();
